@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+.venv/
+venv/
+
+# Built by PyInstaller
+build/
+dist/
+*.spec
+
+.DS_Store

@@ -1,0 +1,7 @@
+# Core engine
+aiortc==1.15.0
+av==17.1.0
+sounddevice==0.5.6
+
+# Credential storage (system keyring, cross-platform)
+keyring==25.7.0

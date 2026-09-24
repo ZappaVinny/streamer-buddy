@@ -24,17 +24,25 @@ import urllib.error
 import urllib.request
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.mediastreams import MediaStreamError
 
-import config
-import transcript
-from audio_bridge import MicrophoneStreamTrack, SpeakerPlayer
-from transcript import TranscriptLogger
+from core import constants, transcript
+from core.audio_bridge import MicrophoneStreamTrack, SpeakerPlayer
+from core.transcript import TranscriptLogger
+from core.events import (
+    Status,
+    StatusEvent,
+    SystemEvent,
+    UsageEvent,
+    SESSION,
+)
 
 
-SESSIONS_URL = "https://api.openai.com/v1/live/sessions"
+class SessionError(Exception):
+    """Session creation failed; message is safe to show the user."""
 
 
-def _create_session(offer_sdp):
+def _create_session(settings, api_key, offer_sdp):
     """
     POST /v1/live/sessions to start the session and exchange SDP.
 
@@ -45,15 +53,13 @@ def _create_session(offer_sdp):
     wire format through SDP.
     """
 
-    instructions = f"{config.PERSONALITY_PROMPT}\n\n{config.SYSTEM_PROMPT}"
-
     body = json.dumps({
         "session": {
-            "model": config.MODEL,
-            "instructions": instructions,
+            "model": constants.MODEL,
+            "instructions": settings.instructions(),
             "audio": {
                 "output": {
-                    "voice": config.VOICE
+                    "voice": settings.voice
                 }
             },
             "delegation": {
@@ -67,11 +73,11 @@ def _create_session(offer_sdp):
     }).encode("utf-8")
 
     request = urllib.request.Request(
-        SESSIONS_URL,
+        constants.SESSIONS_URL,
         data=body,
         method="POST",
         headers={
-            "Authorization": f"Bearer {config.OPENAI_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
     )
@@ -80,9 +86,16 @@ def _create_session(offer_sdp):
         with urllib.request.urlopen(request) as response:
             return json.loads(response.read())
     except urllib.error.HTTPError as error:
-        print("Session creation failed:", error.code)
-        print(error.read().decode("utf-8"))
-        raise
+        detail = error.read().decode("utf-8", errors="replace")
+
+        try:
+            message = json.loads(detail)["error"]["message"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            message = detail.strip() or f"HTTP {error.code}"
+
+        raise SessionError(message) from error
+    except urllib.error.URLError as error:
+        raise SessionError(f"Could not reach OpenAI: {error.reason}") from error
 
 
 class LiveSession:
@@ -94,25 +107,33 @@ class LiveSession:
     directions.
     """
 
-    def __init__(self):
+    def __init__(self, settings, emit):
+        self.settings = settings
         self.session_id = None
-        self.log = TranscriptLogger()
+
+        self._emit = emit
+        self._log = TranscriptLogger(emit)
 
         self._pc = RTCPeerConnection()
-        self._mic = MicrophoneStreamTrack()
-        self._speaker = SpeakerPlayer()
+        self._mic = None
+        self._speaker = None
         self._events = None
         self._started = asyncio.Event()
         self._idle_flusher = None
+        self._chat_flusher = None
         self._loop = None
         self._event_count = 0
+        self._closing = False
 
         # Ordinary chat waiting to be sent as background context.
         # Appended from the Twitch thread, drained on the event loop.
         self._chat_buffer = []
         self._chat_lock = threading.Lock()
         self._chat_buffered_at = None
-        self._chat_flusher = None
+
+    # --------------------------------------------------------
+    # SENDING
+    # --------------------------------------------------------
 
     def send_event(self, event):
         """
@@ -144,9 +165,7 @@ class LiveSession:
         Uses session.commentary.append (the "speakable updates"
         channel) rather than session.instructions.append, because
         chat is untrusted input and the docs warn against copying
-        untrusted text into instructions. The message is quoted and
-        attributed so it reads as a third party talking, not as
-        something for the model to recite.
+        untrusted text into instructions.
         """
 
         self._event_count += 1
@@ -170,14 +189,14 @@ class LiveSession:
 
         Goes out via session.thinking.append (the "quiet context"
         channel), so it's remembered and available to reference but
-        doesn't make him say anything. That way if the streamer
-        brings up something chat was talking about, he already has it.
+        doesn't make him say anything.
 
         Safe to call from the Twitch thread — this only touches the
         buffer; the sending happens on the event loop.
         """
 
-        trimmed = message.strip()[:config.CHAT_CONTEXT_MAX_MESSAGE_CHARS]
+        limit = self.settings.context_max_message_chars
+        trimmed = message.strip()[:limit]
 
         if not trimmed:
             return
@@ -191,6 +210,8 @@ class LiveSession:
     def _flush_chat_context(self):
         """Send buffered chat as one digest. Event loop only."""
 
+        limit = self.settings.context_max_messages
+
         with self._chat_lock:
             if not self._chat_buffer:
                 return
@@ -198,8 +219,8 @@ class LiveSession:
             # Only take a capped batch: a burst of chat has to go out
             # across several digests rather than one oversized append
             # that busts the 500-token limit.
-            lines = self._chat_buffer[:config.CHAT_CONTEXT_MAX_MESSAGES]
-            del self._chat_buffer[:config.CHAT_CONTEXT_MAX_MESSAGES]
+            lines = self._chat_buffer[:limit]
+            del self._chat_buffer[:limit]
 
             self._chat_buffered_at = (
                 time.monotonic() if self._chat_buffer else None
@@ -239,20 +260,24 @@ class LiveSession:
                 stale = (
                     self._chat_buffered_at is not None
                     and time.monotonic() - self._chat_buffered_at
-                    >= config.CHAT_CONTEXT_FLUSH_SECONDS
+                    >= self.settings.context_flush_seconds
                 )
 
-            if count >= config.CHAT_CONTEXT_MAX_MESSAGES or stale:
+            if count >= self.settings.context_max_messages or stale:
                 self._flush_chat_context()
 
-    async def connect(self):
-        if not config.OPENAI_API_KEY:
-            raise SystemExit(
-                "Set the OPENAI_API_KEY environment variable before running."
-            )
+    # --------------------------------------------------------
+    # LIFECYCLE
+    # --------------------------------------------------------
+
+    async def connect(self, api_key):
+        self._emit(StatusEvent(SESSION, Status.CONNECTING))
 
         # Captured so other threads can hand events back to the loop.
         self._loop = asyncio.get_running_loop()
+
+        self._mic = MicrophoneStreamTrack(self.settings, self._emit)
+        self._speaker = SpeakerPlayer(self.settings, self._emit)
 
         self._pc.addTrack(self._mic)
         self._events = self._pc.createDataChannel("oai-events")
@@ -268,11 +293,15 @@ class LiveSession:
         while self._pc.iceGatheringState != "complete":
             await asyncio.sleep(0.1)
 
-        self.log.system("Creating GPT-Live session...")
-        result = _create_session(self._pc.localDescription.sdp)
+        result = await asyncio.to_thread(
+            _create_session,
+            self.settings,
+            api_key,
+            self._pc.localDescription.sdp,
+        )
 
         self.session_id = result["session"]["id"]
-        self.log.system(f"Session created: {self.session_id}")
+        self._emit(SystemEvent(f"Session created: {self.session_id}"))
 
         await self._pc.setRemoteDescription(
             RTCSessionDescription(
@@ -282,7 +311,7 @@ class LiveSession:
         )
 
         self._idle_flusher = asyncio.ensure_future(
-            self.log.run_idle_flusher()
+            self._log.run_idle_flusher()
         )
         self._chat_flusher = asyncio.ensure_future(
             self._run_chat_context_flusher()
@@ -291,20 +320,24 @@ class LiveSession:
         await self._started.wait()
 
     async def close(self):
+        self._closing = True
         self.send_event({"type": "session.close"})
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
 
-        if self._idle_flusher:
-            self._idle_flusher.cancel()
+        for task in (self._idle_flusher, self._chat_flusher):
+            if task:
+                task.cancel()
 
-        if self._chat_flusher:
-            self._chat_flusher.cancel()
+        self._log.flush()
 
-        self.log.flush()
+        if self._mic:
+            self._mic.stop()
 
-        self._mic.stop()
-        self._speaker.stop()
+        if self._speaker:
+            self._speaker.stop()
+
         await self._pc.close()
+        self._emit(StatusEvent(SESSION, Status.OFFLINE))
 
     # --------------------------------------------------------
     # EVENT HANDLING
@@ -319,11 +352,11 @@ class LiveSession:
         event_type = event.get("type")
 
         if event_type == "session.started":
-            self.log.system("Session started — talk normally.")
+            self._emit(StatusEvent(SESSION, Status.ONLINE))
             self._started.set()
 
         elif event_type == "session.input_transcript.delta":
-            self.log.add(
+            self._log.add(
                 transcript.YOU,
                 event.get("delta", ""),
                 start_ms=event.get("start_ms"),
@@ -331,19 +364,28 @@ class LiveSession:
             )
 
         elif event_type == "session.output_transcript.delta":
-            self.log.add(
+            self._log.add(
                 transcript.ASSISTANT,
                 event.get("delta", ""),
                 start_ms=event.get("start_ms"),
                 end_ms=event.get("end_ms")
             )
 
+        elif event_type == "session.usage.updated":
+            usage = event.get("usage", {})
+            window = event.get("context_window", {})
+
+            self._emit(UsageEvent(
+                seconds=float(usage.get("seconds", 0.0)),
+                context_ratio=float(window.get("usage_ratio", 0.0)),
+            ))
+
         elif event_type == "session.closed":
-            self.log.system(f"Session closed. Usage: {event.get('usage')}")
+            self._emit(StatusEvent(SESSION, Status.OFFLINE))
 
         elif event_type == "error":
-            self.log.system("GPT-LIVE ERROR:")
-            print(json.dumps(event, indent=2))
+            detail = event.get("error", {}).get("message", "unknown error")
+            self._emit(StatusEvent(SESSION, Status.ERROR, detail))
 
     def _on_track(self, track):
         if track.kind != "audio":
@@ -352,10 +394,16 @@ class LiveSession:
         async def play():
             try:
                 await self._speaker.consume(track)
+            except (asyncio.CancelledError, MediaStreamError):
+                # The track ending is how a normal disconnect looks
+                # from in here — not something to report.
+                pass
             except Exception:
-                # Without this the task dies silently and playback
-                # just stops with no explanation.
-                self.log.system("Audio playback task crashed:")
-                traceback.print_exc()
+                # Anything else would otherwise kill this task
+                # silently and stop playback with no explanation.
+                if not self._closing:
+                    self._emit(SystemEvent(
+                        "Audio playback stopped:\n" + traceback.format_exc()
+                    ))
 
         asyncio.ensure_future(play())
